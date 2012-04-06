@@ -1,7 +1,7 @@
 import collections
 import string
 import struct
-from itertools import izip, cycle
+from itertools import izip, cycle, imap
 import random
 import socket
 
@@ -390,14 +390,17 @@ class WebSocket(object):
                     idx += 8
 
                 if mask:
-                    masklist = cycle(ord(x) for x in buf[idx:idx+4])
+                    maskdata = buf[idx:idx+4]
                     idx += 4
 
                 data = buf[idx:idx+length]
                 idx += length
 
                 if mask:
-                    data = ''.join(chr(ord(d)^m) for d,m in izip(data, masklist))
+                    data = ''.join(chr(d^m) for d,m in izip(
+                                                    imap(ord, data),
+                                                    cycle(imap(ord, maskdata))
+                                                    ))
 
                 if opcode == 0:  #continuation
                     pass  #TODO with fin
