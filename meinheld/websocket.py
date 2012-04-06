@@ -308,33 +308,36 @@ class WebSocket(object):
             packed = "\x00%s\xFF" % message
 
         elif self.version in (13,):
-            packed = []
+            # payload
             opcode = 2
             if isinstance(message, unicode):
-                data = message.encode('utf-8')
+                payload = message.encode('utf-8')
                 opcode = 1
             elif not isinstance(message, str):
-                data = str(message)
+                payload = str(message)
 
-            packed.append(chr(0x80|opcode))  #0x80 is fin
+            # header(fin,maskflag,opcode,length)
+            fin = 0x80  #0x80:fin, 0:continuation
             mask = 0x80  #0:unmasked, 0x80:masked
-            length = len(data)
-            if length > 0xffff:
-                packed.append(chr(mask|127))
-                packed.append(struct.pack(">Q", length))
-            elif length > 126:
-                packed.append(chr(mask|126))
-                packed.append(struct.pack(">H", length))
+            length = len(payload)
+            if length < 126:
+                header = struct.pack(">BB", fin|opcode, mask|length)
+            elif 126 <= length <= 0xffff:
+                header = struct.pack(">BBH", fin|opcode, mask|126, length)
+            elif 0xffff < length <= 0xffffffffffffffff:
+                header = struct.pack(">BBQ", fin|opcode, mask|127, length)
             else:
-                packed.append(chr(mask|length))
+                #TODO: partial packet
+                raise ValueError("Can't send over 64bit length. (partial packet are not supported)") 
 
+            # maskdata, masked-payload
+            maskdata = ''
             if mask:
-                mask = struct.pack(">I", random.randint(0,0xffffffff))
-                packed.append(mask)
-                masklist = cycle(ord(x) for x in mask)
-                data = ''.join(chr(ord(d)^m) for d,m in izip(data, masklist))
-            packed.append(data)
-            packed = ''.join(packed)
+                maskdata = struct.pack(">I", random.randint(0,0xffffffff))
+                masklist = cycle(ord(x) for x in maskdata)
+                payload = ''.join(chr(ord(d)^m) for d,m in izip(payload, masklist))
+
+            packed = header + maskdata + payload
 
         else:
             raise ValueError("Unknown WebSocket protocol version.") 
@@ -373,7 +376,7 @@ class WebSocket(object):
         elif self.version in (13,):
             idx = 0
             while buf:
-                b1, b2 = ord(buf[idx]), ord(buf[idx+1])
+                b1, b2 = struct.unpack('>BB', buf[idx:idx+1])
                 idx += 2
                 fin = bool(b1 & 0x80)  #TODO with opcode==0
                 opcode = b1 & 0x0f
