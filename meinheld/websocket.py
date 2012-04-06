@@ -1,18 +1,25 @@
 import collections
 import string
 import struct
+from itertools import izip, cycle
+import random
 import socket
 
 try:
-    from hashlib import md5
+    from hashlib import md5, sha1
 except ImportError: #pragma NO COVER
     from md5 import md5
+    from sha import sha as sha1
 
 from meinheld import server, patch
 from meinheld.common import Continuation, CLIENT_KEY, CONTINUATION_KEY
 patch.patch_socket()
 
 import socket
+
+def _extract_comma(value):
+    return [x.strip() for x in value.split(',')]
+
 
 class WebSocketMiddleware(object):
 
@@ -28,19 +35,25 @@ class WebSocketMiddleware(object):
             elif char == " ":
                 spaces += 1
         return int(out) / spaces
-    
+
     def setup(self, environ):
         protocol_version = None
-        if not (environ.get('HTTP_CONNECTION') == 'Upgrade' and
-                environ.get('HTTP_UPGRADE') == 'WebSocket'):
+        if not ("Upgrade" in _extract_comma(environ.get('HTTP_CONNECTION','')) and
+                environ.get('HTTP_UPGRADE','').lower() == 'websocket'):
             return 
     
-        # See if they sent the new-format headers
         if 'HTTP_SEC_WEBSOCKET_KEY1' in environ:
             protocol_version = 76
             if 'HTTP_SEC_WEBSOCKET_KEY2' not in environ:
                 # That's bad.
                 return 
+        elif 'HTTP_SEC_WEBSOCKET_KEY' in environ:
+            protocol_version = environ['HTTP_SEC_WEBSOCKET_VERSION']  # RFC 6455
+            if protocol_version in ('13',):  #skip version 4,5,6,7,8
+                protocol_version = int(protocol_version)
+            else:
+                # Unknown
+                return
         else:
             protocol_version = 75
 
@@ -58,6 +71,10 @@ class WebSocketMiddleware(object):
             key3 = environ['wsgi.input'].read(8)
             key = struct.pack(">II", key1, key2) + key3
             response = md5(key).digest()
+        elif protocol_version == 13:
+            key1 = environ['HTTP_SEC_WEBSOCKET_KEY']
+            key2 = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+            response = sha1(key1 + key2).digest().encode('base64').strip()
         
         # Start building the response
         location = 'ws://%s%s%s' % (
@@ -88,6 +105,17 @@ class WebSocketMiddleware(object):
                     environ.get('HTTP_SEC_WEBSOCKET_PROTOCOL', 'default'),
                     location,
                     response))
+        elif protocol_version == 13:
+            handshake_reply = ("HTTP/1.1 101 Switching Protocols\r\n"
+                               "Upgrade: websocket\r\n"
+                               "Connection: Upgrade\r\n"
+                               "Origin: %s\r\n"
+                               "Sec-WebSocket-Accept: %s\r\n"
+                               "\r\n"% (
+                    environ.get('HTTP_ORIGIN'),
+                    response))
+            if 'HTTP_SEC_WEBSOCKET_PROTOCOL' in environ:
+                handshake_reply += 'Sec-WebSocket-Protocol: %s\r\n' % environ.get('HTTP_SEC_WEBSOCKET_PROTOCOL')
         else: #pragma NO COVER
             raise ValueError("Unknown WebSocket protocol version.") 
         
@@ -122,8 +150,8 @@ class WebSocketWSGI(object):
         self.protocol_version = None
 
     def __call__(self, environ, start_response):
-        if not (environ.get('HTTP_CONNECTION') == 'Upgrade' and
-                environ.get('HTTP_UPGRADE') == 'WebSocket'):
+        if not ("Upgrade" in _extract_comma(environ.get('HTTP_CONNECTION','')) and
+                environ.get('HTTP_UPGRADE','').lower() == 'websocket'):
             # need to check a few more things here for true compliance
             start_response('400 Bad Request', [('Connection','close')])
             return [""]
@@ -134,6 +162,13 @@ class WebSocketWSGI(object):
             if 'HTTP_SEC_WEBSOCKET_KEY2' not in environ:
                 # That's bad.
                 start_response('400 Bad Request', [('Connection','close')])
+                return [""]
+        elif 'HTTP_SEC_WEBSOCKET_KEY' in environ:
+            protocol_version = environ['HTTP_SEC_WEBSOCKET_VERSION']  # RFC 6455
+            if protocol_version in ('13',):  #skip version 4,5,6,7,8
+                protocol_version = int(protocol_version)
+            else:
+                # Unknown
                 return [""]
         else:
             self.protocol_version = 75
@@ -153,6 +188,10 @@ class WebSocketWSGI(object):
             key3 = environ['wsgi.input'].read(8)
             key = struct.pack(">II", key1, key2) + key3
             response = md5(key).digest()
+        elif protocol_version == 13:
+            key1 = environ['HTTP_SEC_WEBSOCKET_KEY']
+            key2 = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+            response = sha1(key1 + key2).digest().encode('base64').strip()
         
         # Start building the response
         location = 'ws://%s%s%s' % (
@@ -183,6 +222,17 @@ class WebSocketWSGI(object):
                     environ.get('HTTP_SEC_WEBSOCKET_PROTOCOL', 'default'),
                     location,
                     response))
+        elif protocol_version == 13:
+            handshake_reply = ("HTTP/1.1 101 Switching Protocols\r\n"
+                               "Upgrade: websocket\r\n"
+                               "Connection: Upgrade\r\n"
+                               "Origin: %s\r\n"
+                               "Sec-WebSocket-Accept: %s\r\n"
+                               "\r\n"% (
+                    environ.get('HTTP_ORIGIN'),
+                    response))
+            if 'HTTP_SEC_WEBSOCKET_PROTOCOL' in environ:
+                handshake_reply += 'Sec-WebSocket-Protocol: %s\r\n' % environ.get('HTTP_SEC_WEBSOCKET_PROTOCOL')
         else: #pragma NO COVER
             raise ValueError("Unknown WebSocket protocol version.") 
         
@@ -245,17 +295,50 @@ class WebSocket(object):
         self._msgs = collections.deque()
         #self._sendlock = semaphore.Semaphore()
 
-    @staticmethod
-    def _pack_message(message):
+    def _pack_message(self, message):
         """Pack the message inside ``00`` and ``FF``
 
         As per the dataframing section (5.3) for the websocket spec
         """
-        if isinstance(message, unicode):
-            message = message.encode('utf-8')
-        elif not isinstance(message, str):
-            message = str(message)
-        packed = "\x00%s\xFF" % message
+        if self.version in (75, 76):
+            if isinstance(message, unicode):
+                message = message.encode('utf-8')
+            elif not isinstance(message, str):
+                message = str(message)
+            packed = "\x00%s\xFF" % message
+
+        elif self.version in (13,):
+            packed = []
+            opcode = 2
+            if isinstance(message, unicode):
+                data = message.encode('utf-8')
+                opcode = 1
+            elif not isinstance(message, str):
+                data = str(message)
+
+            packed.append(chr(0x80|opcode))  #0x80 is fin
+            mask = 0x80  #0:unmasked, 0x80:masked
+            length = len(data)
+            if length > 0xffff:
+                packed.append(chr(mask|127))
+                packed.append(struct.pack(">Q", length))
+            elif length > 126:
+                packed.append(chr(mask|126))
+                packed.append(struct.pack(">H", length))
+            else:
+                packed.append(chr(mask|length))
+
+            if mask:
+                mask = struct.pack(">I", random.randint(0,0xffffffff))
+                packed.append(mask)
+                masklist = cycle(ord(x) for x in mask)
+                data = ''.join(chr(ord(d)^m) for d,m in izip(data, masklist))
+            packed.append(data)
+            packed = ''.join(packed)
+
+        else:
+            raise ValueError("Unknown WebSocket protocol version.") 
+
         return packed
 
     def _parse_messages(self):
@@ -266,24 +349,74 @@ class WebSocket(object):
         Returns an array of messages, and the buffer remainder that
         didn't contain any full messages."""
         msgs = []
-        end_idx = 0
         buf = self._buf
-        while buf:
-            frame_type = ord(buf[0])
-            if frame_type == 0:
-                # Normal message.
-                end_idx = buf.find("\xFF")
-                if end_idx == -1: #pragma NO COVER
+
+        if self.version in (75, 76):
+            end_idx = 0
+            while buf:
+                frame_type = ord(buf[0])
+                if frame_type == 0:
+                    # Normal message.
+                    end_idx = buf.find("\xFF")
+                    if end_idx == -1: #pragma NO COVER
+                        break
+                    msgs.append(buf[1:end_idx].decode('utf-8', 'replace'))
+                    buf = buf[end_idx+1:]
+                elif frame_type == 255:
+                    # Closing handshake.
+                    assert ord(buf[1]) == 0, "Unexpected closing handshake: %r" % buf
+                    self.websocket_closed = True
                     break
-                msgs.append(buf[1:end_idx].decode('utf-8', 'replace'))
-                buf = buf[end_idx+1:]
-            elif frame_type == 255:
-                # Closing handshake.
-                assert ord(buf[1]) == 0, "Unexpected closing handshake: %r" % buf
-                self.websocket_closed = True
-                break
-            else:
-                raise ValueError("Don't understand how to parse this type of message: %r" % buf)
+                else:
+                    raise ValueError("Don't understand how to parse this type of message: %r" % buf)
+
+        elif self.version in (13,):
+            idx = 0
+            while buf:
+                b1, b2 = ord(buf[idx]), ord(buf[idx+1])
+                idx += 2
+                fin = bool(b1 & 0x80)  #TODO with opcode==0
+                opcode = b1 & 0x0f
+                mask = bool(b2 & 0x80)
+                length = (b2 & 0x7f)
+                if length == 126:
+                    length = struct.unpack('>H', buf[idx:idx+2])
+                    idx += 2
+                elif length == 127:
+                    length = struct.unpack('>Q', buf[dx::idx+8])
+                    idx += 8
+
+                if mask:
+                    masklist = cycle(ord(x) for x in buf[idx:idx+4])
+                    idx += 4
+
+                data = buf[idx:idx+length]
+                idx += length
+
+                if mask:
+                    data = ''.join(chr(ord(d)^m) for d,m in izip(data, masklist))
+
+                if opcode == 0:  #continuation
+                    pass  #TODO with fin
+                elif opcode == 1:  #text
+                    data = data.decode('utf-8', 'replace')
+                elif opcode == 2:  #binary
+                    pass
+                elif opcode == 8:  #close
+                    self.websocket_closed = True
+                    #TODO process 2byte close status
+                    break
+                elif opcode == 9:  #ping
+                    pass  #TODO
+                elif opcode == 10: #pong
+                    pass  #TODO
+                else:
+                    raise ValueError("Don't understand how to parse this type of message: %r" % buf)
+                msgs.append(data)
+                buf = buf[idx:]
+        else:
+            raise ValueError("Unknown WebSocket protocol version.") 
+
         self._buf = buf
         return msgs
     
